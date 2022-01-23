@@ -1,0 +1,330 @@
+---
+title: "MovieLens Project"
+author: "Aadyant Khatri"
+date: "21/01/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+##########################################################
+# Create edx set, validation set (final hold-out test set)
+##########################################################
+
+# Note: this process could take a couple of minutes
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(caret)
+library(data.table)
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+# if using R 4.0 or later:
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+##########################################################
+# Splitting edx data set in train set and test set
+##########################################################
+edx_test_index <- createDataPartition(y = edx$rating, times = 1, p = 0.01, list = FALSE)
+
+train_set <- edx[-edx_test_index, ]
+test_set <- edx[edx_test_index, ]
+
+##########################################################
+# Creating base model which predicts average of all ratings for each movie
+##########################################################
+avg_rating <- mean(train_set$rating)
+
+base_model_predictions <- rep(avg_rating, nrow(test_set))
+
+base_model_rmse <- RMSE(test_set$rating, base_model_predictions, na.rm=TRUE)
+
+rmse_results <- data_frame(Method = "Base Model", RMSE = base_model_rmse)
+
+##########################################################
+# Creating model which predicts ratings based on average rating of each movie
+##########################################################
+movie_avgs <- train_set %>% 
+  group_by(movieId) %>% 
+  summarize(movie_avg = mean(rating - avg_rating))
+
+model_1_predictions <- test_set %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  mutate(prediction = avg_rating + movie_avg) %>% .$prediction
+
+model_1_rmse <- RMSE(test_set$rating, model_1_predictions, na.rm=TRUE)
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(Method="Movie Effect Model",
+                                     RMSE = model_1_rmse ))
+
+##########################################################
+# Creating model which predicts ratings based on average rating of each movie AND the average rating a user provides
+##########################################################
+user_avgs <- train_set %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(user_avg = mean(rating - avg_rating - movie_avg))
+
+model_2_predictions <- test_set %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  mutate(prediction = avg_rating + movie_avg + user_avg) %>% .$prediction
+
+model_2_rmse <- RMSE(test_set$rating, model_2_predictions, na.rm=TRUE)
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(Method="Movie + User Effects Model",  
+                                     RMSE = model_2_rmse ))
+
+##########################################################
+# Introducing regularization to above models to constrain large estimates of averages
+##########################################################
+lambda <- 3 # trying tuning parameter value = 3
+
+regularized_movie_avgs <- train_set %>% 
+  group_by(movieId) %>% 
+  summarize(regularized_movie_avg = sum(rating - avg_rating)/(n() + lambda)) # Regularization on movie specific effects
+
+regularized_user_avgs <- train_set %>% 
+  left_join(regularized_movie_avgs, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(regularized_user_avg = sum(rating - regularized_movie_avg - avg_rating)/(n() + lambda)) # Regularization on user specific effects
+
+model_3_predictions <- test_set %>% 
+  left_join(regularized_movie_avgs, by = "movieId") %>%
+  left_join(regularized_user_avgs, by = "userId") %>%
+  mutate(prediction = avg_rating + regularized_movie_avg + regularized_user_avg) %>% .$prediction
+
+model_3_rmse <- RMSE(model_3_predictions, test_set$rating, na.rm=TRUE)
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(Method="Regularized Model (lambda = 3)",  
+                                     RMSE = model_3_rmse ))
+
+##########################################################
+# Testing out range of values for lambda
+##########################################################
+lambdas <- seq(0, 10, 0.2)
+
+RMSEs <- sapply(lambdas, function(l){
+
+  regularized_movie_avgs <- train_set %>%
+    group_by(movieId) %>%
+    summarize(regularized_movie_avg = sum(rating - avg_rating)/(n() + l))
+
+  regularized_user_avgs <- train_set %>%
+    left_join(regularized_movie_avgs, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(regularized_user_avg = sum(rating - regularized_movie_avg - avg_rating)/(n() + l))
+
+  model_4_predictions <- test_set %>%
+    left_join(regularized_movie_avgs, by = "movieId") %>%
+    left_join(regularized_user_avgs, by = "userId") %>%
+    mutate(prediction = avg_rating + regularized_movie_avg + regularized_user_avg) %>% .$prediction
+
+  return(RMSE(model_4_predictions, test_set$rating, na.rm = TRUE))
+})
+
+qplot(lambdas, RMSEs, xlab = "Lambda", ylab = "RMSE")
+
+min_lambda <- lambdas[which.min(RMSEs)]
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(Method="Regularized Model (using optimum lambda)",
+                                     RMSE = min(RMSEs)))
+rmse_results %>% knitr::kable()
+
+##########################################################
+# Making final prediction using best lambda
+##########################################################
+final_movie_avgs <- train_set %>% 
+  group_by(movieId) %>% 
+  summarize(final_movie_avg = sum(rating - avg_rating)/(n() + min_lambda))
+
+final_user_avgs <- train_set %>% 
+  left_join(final_movie_avgs, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(final_user_avg = sum(rating - final_movie_avg - avg_rating)/(n() + min_lambda))
+
+final_predictions <- validation %>% 
+  left_join(final_movie_avgs, by = "movieId") %>%
+  left_join(final_user_avgs, by = "userId") %>%
+  mutate(prediction = avg_rating + final_movie_avg + final_user_avg) %>% .$prediction
+
+final_rmse <- RMSE(validation$rating, final_predictions, na.rm = TRUE)
+```
+
+## Overview
+
+This project is aimed at predicting the rating a user would give to a movie. This would help in recommending relevant movies to users.
+
+For this project, **MovieLens** data set from GroupLens Research was downloaded. This data set contains 10 million ratings given by 72,000 users to 10,000 movies.
+
+The type of model I intended to create in this project is a part of **recommendation systems**. In this model, for each outcome, the set of predictors are different which makes such machine learning models more complicated than others.
+
+## Methodology
+
+### Model - 1  
+It was initially assumed that every variation in the rating of different movies by different users is explained by **random errors**. In such a case, using the average rating of all movies across all users as the prediction would give the least error. This was treated as the base model and it gave Root Mean Square Error (RMSE) = `r base_model_rmse`
+
+
+### Model - 2  
+The RMSE obtained with the base model was further reduced by super-imposing the **movie effect**. This approach takes into consideration the fact that some movies are relatively better than others and hence get a higher rating.
+
+
+```{r movies figure, echo=FALSE, out.width="50%", fig.align = 'center'}
+movie_avgs %>% qplot(movie_avg, geom ="histogram", bins = 10, data = ., color = I("black"), xlab = "Movie Rating", ylab = "Count")
+```
+
+To capture this effect, for each movie, difference between its true ratings and the average rating was calculated and then its average was taken. 
+
+```{r movie effect code, eval=FALSE}
+movie_avgs <- train_set %>% 
+  group_by(movieId) %>% 
+  summarize(movie_avg = mean(rating - avg_rating))
+```
+
+This method gave RMSE = `r model_1_rmse`
+
+
+
+### Model - 3  
+The model was improved by also considering the **user effect** which takes into account the fact that different users prefer different genres of movies.
+
+```{r users figure, echo=FALSE, out.width="50%", fig.align = 'center'}
+user_avgs %>% qplot(user_avg, geom ="histogram", bins = 10, data = ., color = I("black"), xlab = "User Rating", ylab = "Count")
+```
+
+This effect was approximated by subtracting the average rating and movie effect from the true ratings and then averaging the values for each user. 
+
+```{r user effect code, eval=FALSE}
+user_avgs <- train_set %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(user_avg = mean(rating - avg_rating - movie_avg))
+```
+
+Model 3 resulted in RMSE = `r model_2_rmse`
+
+
+
+### Model - 4  
+To refine the model further, I used **regularization**. Regularization constrains the total variability of the effect sizes by penalizing large estimates that come from small sample sizes. This is done by dividing the effects by a parameter called lambda. 
+
+```{r lambda = 3, eval=FALSE}
+# trying tuning parameter value = 3
+lambda <- 3 
+
+# Regularization on movie specific effects
+regularized_movie_avgs <- train_set %>% 
+  group_by(movieId) %>% 
+  summarize(regularized_movie_avg = sum(rating - avg_rating)/(n() + lambda)) 
+
+# Regularization on user specific effects
+regularized_user_avgs <- train_set %>% 
+  left_join(regularized_movie_avgs, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(regularized_user_avg = sum(rating - regularized_movie_avg - avg_rating)/(n() + lambda)) 
+```
+
+Here, lambda is a hyper-parameter and after testing out multiple values, its optimum value was found and then used for making the final prediction. 
+
+```{r multiple lambdas, eval=FALSE}
+# Testing multiple lambda values
+lambdas <- seq(0, 10, 0.2)
+
+RMSEs <- sapply(lambdas, function(l){
+  
+  regularized_movie_avgs <- train_set %>% 
+    group_by(movieId) %>% 
+    summarize(regularized_movie_avg = sum(rating - avg_rating)/(n() + l))
+  
+  regularized_user_avgs <- train_set %>% 
+    left_join(regularized_movie_avgs, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(regularized_user_avg = sum(rating - regularized_movie_avg - avg_rating)/(n() + l))
+  
+  model_4_predictions <- test_set %>% 
+    left_join(regularized_movie_avgs, by = "movieId") %>%
+    left_join(regularized_user_avgs, by = "userId") %>%
+    mutate(prediction = avg_rating + regularized_movie_avg + regularized_user_avg) %>% .$prediction
+  
+  return(RMSE(model_4_predictions, test_set$rating, na.rm = TRUE))
+})
+```
+```{r RMSE vs lambda figure, echo=FALSE, out.width="50%", fig.align = 'center'}
+qplot(lambdas, RMSEs, xlab = "Lambda", ylab = "RMSE")
+```
+
+The lambda that gave the best RMSE was found to be = `r min_lambda` and it yielded RMSE = `r min(RMSEs)`
+
+## Results
+
+The RMSEs obtained with each model have been compiled in the table below.
+
+```{r models table, echo=FALSE}
+rmse_results %>% knitr::kable()
+```
+
+My last model which factored in movie and user specific effects, and also regularized the values, performed the best. This model was used to make the final prediction on the validation data.
+
+```{r prediction code, eval=FALSE}
+final_movie_avgs <- train_set %>% 
+  group_by(movieId) %>% 
+  summarize(final_movie_avg = sum(rating - avg_rating)/(n() + min_lambda))
+
+final_user_avgs <- train_set %>% 
+  left_join(final_movie_avgs, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(final_user_avg = sum(rating - final_movie_avg - avg_rating)/(n() + min_lambda))
+
+final_predictions <- validation %>% 
+  left_join(final_movie_avgs, by = "movieId") %>%
+  left_join(final_user_avgs, by = "userId") %>%
+  mutate(prediction = avg_rating + final_movie_avg + final_user_avg) %>% .$prediction
+```
+
+This gave RMSE = **`r final_rmse`**
+
+## Conclusion
+
+I was able to create a model which could predict the rating of movies by different users with a decent accuracy (low RMSE). 
+
+This project helped in explaining the variability in ratings because of various effects. It also became evident that regularization can be used for reducing the error as it ensures that the effects don't explode into large values.
+
+However, a limitation of my model is that it requires every movie and user, for which prediction has to be made, must be present in the training data set. This is because it is necessary to calculate the movie effect and the user effect for every movie and user respectively. Thus, my model may not work with new movies and users.
